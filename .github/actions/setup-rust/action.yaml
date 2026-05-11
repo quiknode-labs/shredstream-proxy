@@ -18,16 +18,13 @@ runs:
       run: "echo Cache key: ${{ steps.cache-key-generator.outputs.cache-key }}"
       shell: bash
 
-    # Stock GitHub-hosted runners ship rustup but no specific toolchain. Install the
-    # toolchain pinned in rust-toolchain.toml (channel = "1.84" at the time of writing).
-    # We pass the channel explicitly rather than reading the toml because dtolnay's
-    # action overrides toml-pinning when `toolchain:` is set, and we want predictable
-    # CI behavior whether a user runs the workflow on stock runners or self-hosted ones
-    # that already have rust installed.
+    # Install the Rust toolchain pinned in rust-toolchain.toml.
+    # actions-rust-lang/setup-rust-toolchain reads rust-toolchain.toml when no
+    # explicit `toolchain:` input is given, picking up both the `channel` and the
+    # full `components` list — so this stays a single source of truth. Bumping
+    # rust-toolchain.toml is enough to bump CI; no second place to edit.
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@1.84
-      with:
-        components: rustfmt, clippy
+      uses: actions-rust-lang/setup-rust-toolchain@v1
 
     - name: Install Protobuf
       run: |
