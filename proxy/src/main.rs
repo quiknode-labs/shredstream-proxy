@@ -255,7 +255,11 @@ fn main() -> Result<(), ShredstreamProxyError> {
         }));
     }
 
-    let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
+    let metrics = Arc::new(ShredMetrics::new(
+        args.grpc_service_port.is_some(),
+        args.multicast_subscribe_port,
+        args.multicast_device.clone(),
+    ));
 
     let runtime = Runtime::new()?;
     let mut thread_handles = vec![];
@@ -300,6 +304,8 @@ fn main() -> Result<(), ShredstreamProxyError> {
         unioned_dest_sockets.clone(),
         args.src_bind_addr,
         args.src_bind_port,
+        args.multicast_subscribe_port,
+        args.multicast_device.clone(),
         maybe_multicast_socket,
         args.num_threads,
         deduper.clone(),

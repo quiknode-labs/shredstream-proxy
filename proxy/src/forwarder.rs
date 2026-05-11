@@ -49,6 +49,8 @@ pub fn start_forwarder_threads(
     unioned_dest_sockets: Arc<ArcSwap<Vec<SocketAddr>>>, /* sockets shared between endpoint discovery thread and forwarders */
     src_addr: IpAddr,
     src_port: u16,
+    multicast_subscribe_port: u16,
+    multicast_device: String,
     maybe_multicast_socket: Option<Vec<UdpSocket>>,
     num_threads: Option<usize>,
     deduper: Arc<RwLock<Deduper<2, [u8]>>>,
@@ -136,6 +138,17 @@ pub fn start_forwarder_threads(
         .chain(maybe_multicast_socket.into_iter().flatten())
         .enumerate()
         .flat_map(|(thread_id, incoming_shred_socket)| {
+            let listen_port = incoming_shred_socket
+                .local_addr()
+                .expect("bound socket has local addr")
+                .port();
+            let device_label = if listen_port == multicast_subscribe_port {
+                multicast_device.as_str()
+            } else {
+                "unicast"
+            };
+            info!("Forwarder socket {thread_id}: listen_port={listen_port} device={device_label}");
+
             let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
             let listen_thread = streamer::receiver(
                 format!("ssListen{thread_id}"),
@@ -177,6 +190,7 @@ pub fn start_forwarder_threads(
                             recv(packet_receiver) -> maybe_packet_batch => {
                                 let res = recv_from_channel_and_send_multiple_dest(
                                     maybe_packet_batch,
+                                    listen_port,
                                     &deduper,
                                     &send_socket,
                                     &local_dest_sockets,
@@ -217,6 +231,7 @@ pub fn start_forwarder_threads(
 #[allow(clippy::too_many_arguments)]
 fn recv_from_channel_and_send_multiple_dest(
     maybe_packet_batch: Result<PacketBatch, RecvError>,
+    listen_port: u16,
     deduper: &RwLock<Deduper<2, [u8]>>,
     send_socket: &UdpSocket,
     local_dest_sockets: &[SocketAddr],
@@ -246,12 +261,15 @@ fn recv_from_channel_and_send_multiple_dest(
         &deduper.read().unwrap(),
         &mut packet_batch_vec,
     );
-    // Store stats for each Packet
+    // Store stats for each Packet, keyed by (source IP, local listen port).
+    // listen_port is constant for this thread (one socket per send_thread), so packets
+    // arriving on the multicast vs unicast socket get attributed separately even when
+    // they share a source IP.
     packet_batch_vec.iter().for_each(|batch| {
         batch.iter().for_each(|packet| {
             metrics
                 .packets_received
-                .entry(packet.meta().addr)
+                .entry((packet.meta().addr, listen_port))
                 .and_modify(|(discarded, not_discarded)| {
                     *discarded += packet.meta().discard() as u64;
                     *not_discarded += (!packet.meta().discard()) as u64;
@@ -461,11 +479,19 @@ pub struct ShredMetrics {
     pub fail_forward: AtomicU64,
     /// Number of duplicate shreds received
     pub duplicate: AtomicU64,
-    /// (discarded, not discarded, from other shredstream instances)
-    pub packets_received: DashMap<IpAddr, (u64, u64)>,
+    /// (discarded, not discarded), keyed by (source IP, local listen port).
+    /// The listen port lets operators distinguish multicast (`--multicast-subscribe-port`)
+    /// from unicast (`--src-bind-port`) traffic that shares a source IP.
+    pub packets_received: DashMap<(IpAddr, u16), (u64, u64)>,
 
     // service metrics
     pub enabled_grpc_service: bool,
+    /// Configured multicast listen port; used to render the `device` tag on
+    /// `shredstream_proxy-receiver_stats` at report time.
+    pub multicast_subscribe_port: u16,
+    /// Configured multicast device name (e.g. `doublezero1`); used as the
+    /// `device` tag for packets received on `multicast_subscribe_port`.
+    pub multicast_device: String,
     /// Number of data shreds recovered using coding shreds
     pub recovered_count: AtomicU64,
     /// Number of Solana entries decoded from shreds
@@ -490,14 +516,20 @@ pub struct ShredMetrics {
 
 impl Default for ShredMetrics {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(false, 0, String::new())
     }
 }
 
 impl ShredMetrics {
-    pub fn new(enabled_grpc_service: bool) -> Self {
+    pub fn new(
+        enabled_grpc_service: bool,
+        multicast_subscribe_port: u16,
+        multicast_device: String,
+    ) -> Self {
         Self {
             enabled_grpc_service,
+            multicast_subscribe_port,
+            multicast_device,
             received: Default::default(),
             success_forward: Default::default(),
             fail_forward: Default::default(),
@@ -573,15 +605,23 @@ impl ShredMetrics {
             );
         }
 
-        self.packets_received
-            .retain(|addr, (discarded_packets, not_discarded_packets)| {
+        self.packets_received.retain(
+            |(addr, listen_port), (discarded_packets, not_discarded_packets)| {
+                let device = if *listen_port == self.multicast_subscribe_port {
+                    self.multicast_device.as_str()
+                } else {
+                    "unicast"
+                };
                 datapoint_info!("shredstream_proxy-receiver_stats",
                     "addr" => addr.to_string(),
+                    "listen_port" => listen_port.to_string(),
+                    "device" => device,
                     ("discarded_packets", *discarded_packets, i64),
                     ("not_discarded_packets", *not_discarded_packets, i64),
                 );
                 false
-            });
+            },
+        );
     }
 
     /// resets current values, increments cumulative values
@@ -654,9 +694,9 @@ mod tests {
         packet_sender.send(packet_batch).unwrap();
 
         let dest_socketaddrs = vec![
-            SocketAddr::from_str("0.0.0.0:32881").unwrap(),
-            SocketAddr::from_str("0.0.0.0:33881").unwrap(),
-            SocketAddr::from_str("0.0.0.0:34881").unwrap(),
+            SocketAddr::from_str("127.0.0.1:32881").unwrap(),
+            SocketAddr::from_str("127.0.0.1:33881").unwrap(),
+            SocketAddr::from_str("127.0.0.1:34881").unwrap(),
         ];
 
         let test_listeners = dest_socketaddrs
@@ -671,7 +711,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let udp_sender = UdpSocket::bind("0.0.0.0:10000").unwrap();
+        let udp_sender = UdpSocket::bind("127.0.0.1:10000").unwrap();
 
         // spawn listeners
         test_listeners
@@ -686,6 +726,7 @@ mod tests {
         // send packets
         recv_from_channel_and_send_multiple_dest(
             packet_receiver.recv(),
+            20_000,
             &Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
                 &mut rand::thread_rng(),
                 crate::forwarder::DEDUPER_NUM_BITS,
