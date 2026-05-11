@@ -1,18 +1,25 @@
 <!--
-Thanks for opening a PR against quiknode-labs/shredstream-proxy (a fork of
-jito-labs/shredstream-proxy). Please answer the question below before
-submitting — it affects whether this change should also be offered upstream.
+Thanks for opening a PR against quiknode-labs/shredstream-proxy.
+
+This repository uses a two-branch model:
+  - `main-qn` (default) — QN's working branch. All day-to-day PRs target here.
+  - `master`            — clean mirror of jito-labs/shredstream-proxy, sync only.
+
+Day-to-day work targets `main-qn`. If the change is also useful upstream,
+follow up after merge with a cherry-pick onto a branch off `master` and
+open an upstream PR against `jito-labs/shredstream-proxy:master`.
+
+See CONTRIBUTING.md for the full workflow.
 -->
 
 ## Is this change upstreamable?
 
-- [ ] **Yes** — this is broadly useful and should be offered to
-      `jito-labs/shredstream-proxy` as well. Use an unprefixed or
-      `feature/*` branch name. After this PR merges here, open a separate
-      PR against `jito-labs/shredstream-proxy:master`.
-- [ ] **No** — this is QuickNode-specific (CI runner, deploy paths,
-      operational tooling, OCI bucket paths, fleet-specific defaults,
-      etc.). Use a `qn/*` branch name. Do **not** open an upstream PR.
+- [ ] **Yes** — broadly useful (bug fix, generic feature, refactor). After
+      this PR merges into `main-qn`, cherry-pick onto a branch off `master`
+      and open a PR against `jito-labs/shredstream-proxy:master`.
+- [ ] **No** — QuickNode-specific (CI runner, deploy paths, OCI bucket,
+      fleet defaults, operational tooling). Use a `qn/*` branch name and
+      do **not** open an upstream PR.
 
 ## Summary
 
@@ -20,5 +27,5 @@ submitting — it affects whether this change should also be offered upstream.
 
 ## Test plan
 
-<!-- How was this verified? Local cargo test, deploy to one staging proxy,
+<!-- How was this verified? cargo test locally, deploy to staging,
      specific receiver_stats journal lines, etc. -->
