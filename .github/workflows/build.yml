@@ -15,8 +15,6 @@ jobs:
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
-        with:
-          caller-workflow-name: build
 
       - name: Clippy check
         run: cargo clippy --all-features --all-targets --tests -- -D warnings
