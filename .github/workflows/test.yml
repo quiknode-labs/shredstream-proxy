@@ -5,7 +5,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-22.04-16c-64g-public
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -15,8 +15,6 @@ jobs:
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
-        with:
-          caller-workflow-name: test
 
       - name: Run tests
         run: cargo test --all-features --locked
