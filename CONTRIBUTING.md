@@ -17,6 +17,45 @@ The deploy pipeline (`role_chain_build`) builds release tags. Tags are
 created from `main-qn`, so the resulting binary always carries the QN
 patches.
 
+## What's currently QN-specific
+
+As of this writing, the diff between `main-qn` and `master` is:
+
+| Change | What it does |
+|---|---|
+| `proxy/src/forwarder.rs` + `proxy/src/main.rs` (metric label patch) | Adds `listen_port` and `device` tags to the `shredstream_proxy-receiver_stats` metric so multicast (`device=doublezero1`) and unicast (`device=unicast`) traffic from the same source IP can be attributed separately. Originally needed to measure DoubleZero's marginal contribution to first-arrival shred throughput. Eligible for upstream contribution. |
+| `.github/workflows/*.yml`, `.github/actions/setup-rust/action.yaml` | Switches CI from Jito's private self-hosted runners (`ubuntu-22.04-16c-64g-public`) to stock `ubuntu-22.04`. Replaces Docker Hub publish steps with direct `cargo build --release`. Uses `actions-rust-lang/setup-rust-toolchain` for the toolchain (reads `rust-toolchain.toml`). QN-specific — would not be appropriate upstream. |
+| `.github/PULL_REQUEST_TEMPLATE.md`, `CONTRIBUTING.md` | Fork-management policy (this document). QN-specific. |
+
+When evaluating whether a new change is upstreamable, the metric label
+patch is a useful reference for what "broadly useful" looks like.
+
+## Branch protection
+
+The fork has GitHub Rulesets configured to enforce the two-branch model:
+
+- **`master-mirror-lock`** ruleset on `master`: blocks direct pushes,
+  force-pushes, deletions, and non-fast-forward updates. Only repo
+  admins running `gh repo sync` (which uses the GitHub API, not git
+  push) can advance `master`. This guarantees `master` never diverges
+  from upstream.
+- **`main-qn-pr-review`** ruleset on `main-qn`: requires a pull request
+  with at least one approval before merge. Blocks force-pushes and
+  deletions. CI status checks (`test`, `build`) are required to pass.
+
+If you try `git push origin master` directly, the push will be rejected
+by the ruleset. That's intended — go through `gh repo sync` for upstream
+updates, or open a PR against `main-qn` for QN-specific work.
+
+The active CI workflows on every PR to `main-qn`:
+
+| Workflow | What it runs |
+|---|---|
+| `test` | `cargo test --all-features --locked` |
+| `build` | `cargo clippy --all-features --all-targets --tests -- -D warnings` and `cargo build --release --locked --bin jito-shredstream-proxy` |
+
+Both must pass before merge. The `release` workflow only runs on `v*` tag pushes — it produces a GitHub Release asset.
+
 ## Branch naming
 
 | Prefix | Use for | Branch off | PR target |
