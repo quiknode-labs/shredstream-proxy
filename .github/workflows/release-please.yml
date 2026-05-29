@@ -1,0 +1,28 @@
+name: release-please
+
+# Opens/maintains a release PR on main-qn and, on merge, creates the git tag
+# (vX.Y.Z+qn) and GitHub Release. Binaries are NOT built here — role_chain_build
+# builds them from the tag — so this workflow only versions, tags, and releases.
+#
+# The version (including the +qn build-metadata marker) lives in
+# [workspace.package] version in Cargo.toml. release-please's default versioning
+# strategy preserves build metadata across bumps, so +qn carries through
+# automatically (0.2.14+qn -> fix -> 0.2.15+qn -> feat -> 0.3.0+qn).
+
+on:
+  push:
+    branches: [main-qn]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          target-branch: main-qn
+          # Picks up release-please-config.json + .release-please-manifest.json
+          # from the repo root by default.
