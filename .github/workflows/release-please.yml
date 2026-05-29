@@ -6,8 +6,13 @@ name: release-please
 #
 # The version (including the +qn build-metadata marker) lives in
 # [workspace.package] version in Cargo.toml. release-please's default versioning
-# strategy preserves build metadata across bumps, so +qn carries through
-# automatically (0.2.14+qn -> fix -> 0.2.15+qn -> feat -> 0.3.0+qn).
+# strategy carries build metadata through every bump -- each VersionUpdater
+# (Major/Minor/Patch) re-emits version.build and Version.toString() appends it --
+# so +qn is preserved automatically (0.2.14+qn -> fix -> 0.2.15+qn -> feat ->
+# 0.3.0+qn). Verified against release-please 17.x. NOTE: release-please does not
+# *generate/increment* build metadata (see googleapis/release-please#1816); it
+# only preserves the constant +qn we set. The `build` job's "Assert version
+# carries +qn" guard fails the release PR loudly if a future version regresses.
 
 on:
   push:

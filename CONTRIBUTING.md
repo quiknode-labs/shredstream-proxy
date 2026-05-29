@@ -82,8 +82,14 @@ bump from [conventional commits](https://www.conventionalcommits.org/):
 | `feat:` | minor | `0.2.14+qn` → `0.3.0+qn` |
 | `feat!:` / `BREAKING CHANGE:` | major | `0.2.14+qn` → `1.0.0+qn` |
 
-release-please's default versioning strategy preserves the `+qn` build metadata
-across bumps automatically, so it never needs to be re-added.
+release-please's default versioning strategy carries the `+qn` build metadata
+through every bump (each `VersionUpdater` re-emits `version.build`), so it never
+needs to be re-added — verified against release-please 17.x. (Note: release-please
+will not *generate or increment* build metadata, only preserve the constant `+qn`
+we set; see [#1816](https://github.com/googleapis/release-please/issues/1816).)
+The `build` CI job asserts the version still carries `+qn`, so if a future
+release-please ever regressed and stripped it, the release PR fails CI rather than
+silently shipping a `+qn`-less version.
 
 **Because PRs are squash-merged, the PR title must be a conventional-commit
 message** — that title becomes the commit release-please reads. Non-conventional
