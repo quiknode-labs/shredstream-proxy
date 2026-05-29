@@ -10,6 +10,11 @@ follow up after merge with a cherry-pick onto a branch off `master` and
 open an upstream PR against `jito-labs/shredstream-proxy:master`.
 
 See CONTRIBUTING.md for the full workflow.
+
+PR TITLE: use a conventional-commit message (e.g. `feat: ...`, `fix: ...`,
+`feat!: ...`). PRs are squash-merged and release-please reads the squash
+commit (= this title) to compute the next version. A non-conventional title
+ships no version bump. See "Versioning & releases" in CONTRIBUTING.md.
 -->
 
 ## Is this change upstreamable?

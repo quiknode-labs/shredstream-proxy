@@ -13,9 +13,11 @@ is unlikely.
 | **`main-qn`** | Default branch on the fork. QN's working line. | All day-to-day PRs. | Everything in `master` + QN-specific patches (CI, deploy plumbing, fleet defaults). |
 | **`master`** | Clean mirror of `jito-labs/shredstream-proxy:master`. | Only branches destined for upstream contribution. | Exactly what's upstream, nothing more. Refreshed via `gh repo sync`. |
 
-The deploy pipeline (`role_chain_build`) builds release tags. Tags are
-created from `main-qn`, so the resulting binary always carries the QN
-patches.
+Releases are managed by [release-please](https://github.com/googleapis/release-please):
+merges to `main-qn` accumulate into a release PR, and merging that PR bumps the
+version, tags `vX.Y.Z+qn`, and cuts a GitHub Release. The deploy pipeline
+(`role_chain_build`) then builds that tag, so the resulting binary always
+carries the QN patches. See [Versioning &amp; releases](#versioning--releases).
 
 ## What's currently QN-specific
 
@@ -26,6 +28,7 @@ As of this writing, the diff between `main-qn` and `master` is:
 | `proxy/src/forwarder.rs` + `proxy/src/main.rs` (metric label patch) | Adds `listen_port` and `device` tags to the `shredstream_proxy-receiver_stats` metric so multicast (`device=doublezero1`) and unicast (`device=unicast`) traffic from the same source IP can be attributed separately. Originally needed to measure DoubleZero's marginal contribution to first-arrival shred throughput. Eligible for upstream contribution. |
 | `.github/workflows/*.yml`, `.github/actions/setup-rust/action.yaml` | Switches CI from Jito's private self-hosted runners (`ubuntu-22.04-16c-64g-public`) to stock `ubuntu-22.04`. Replaces Docker Hub publish steps with direct `cargo build --release`. Uses `actions-rust-lang/setup-rust-toolchain` for the toolchain (reads `rust-toolchain.toml`). QN-specific — would not be appropriate upstream. |
 | `.github/PULL_REQUEST_TEMPLATE.md`, `CONTRIBUTING.md` | Fork-management policy (this document). QN-specific. |
+| `release-please-config.json`, `.release-please-manifest.json`, `.github/workflows/release-please.yml`, `+qn` build metadata in `Cargo.toml` version | Automated, conventional-commit-driven versioning for the fork. The `+qn` build-metadata marker distinguishes QN releases from upstream. QN-specific. |
 
 When evaluating whether a new change is upstreamable, the metric label
 patch is a useful reference for what "broadly useful" looks like.
@@ -54,7 +57,55 @@ The active CI workflows on every PR to `main-qn`:
 | `test` | `cargo test --all-features --locked` |
 | `build` | `cargo clippy --all-features --all-targets --tests -- -D warnings` and `cargo build --release --locked --bin jito-shredstream-proxy` |
 
-Both must pass before merge. The `release` workflow only runs on `v*` tag pushes — it produces a GitHub Release asset.
+Both must pass before merge. The `release-please` workflow runs on pushes to
+`main-qn` (not on PRs) and only manages the release PR, tag, and GitHub Release —
+it does not build binaries (`role_chain_build` does). See
+[Versioning &amp; releases](#versioning--releases).
+
+## Versioning &amp; releases
+
+Versions are **`X.Y.Z+qn`** — a QN-owned semver line with a `+qn`
+[build-metadata](https://semver.org/#spec-item-10) marker. `+qn` is
+precedence-neutral per the semver spec (so `0.2.14+qn` compares equal to
+`0.2.14`) but unmistakably marks a QN build. The version lives in one place,
+`[workspace.package] version` in the root `Cargo.toml`; clap reads it via
+`CARGO_PKG_VERSION`, so `jito-shredstream-proxy -V` prints it verbatim. Keeping
+this in sync with the released tag is the whole point of the pipeline —
+`role_solana` detects the deployed version by substring-matching `-V` output.
+
+[release-please](https://github.com/googleapis/release-please) automates the
+bump from [conventional commits](https://www.conventionalcommits.org/):
+
+| Commit type | Bump | Example |
+|---|---|---|
+| `fix:` | patch | `0.2.14+qn` → `0.2.15+qn` |
+| `feat:` | minor | `0.2.14+qn` → `0.3.0+qn` |
+| `feat!:` / `BREAKING CHANGE:` | major | `0.2.14+qn` → `1.0.0+qn` |
+
+release-please's default versioning strategy carries the `+qn` build metadata
+through every bump (each `VersionUpdater` re-emits `version.build`), so it never
+needs to be re-added — verified against release-please 17.x. (Note: release-please
+will not *generate or increment* build metadata, only preserve the constant `+qn`
+we set; see [#1816](https://github.com/googleapis/release-please/issues/1816).)
+The `build` CI job asserts the version still carries `+qn`, so if a future
+release-please ever regressed and stripped it, the release PR fails CI rather than
+silently shipping a `+qn`-less version.
+
+**Because PRs are squash-merged, the PR title must be a conventional-commit
+message** — that title becomes the commit release-please reads. Non-conventional
+titles are ignored (no version bump).
+
+The release flow:
+
+1. Merge PRs to `main-qn` with conventional titles.
+2. release-please opens/updates a **release PR** (`chore: release X.Y.Z+qn`) that
+   bumps `Cargo.toml` + `Cargo.lock` and updates `CHANGELOG.md`. Review the
+   proposed version there; override it with a `Release-As: X.Y.Z+qn` footer in a
+   commit if needed.
+3. Merging the release PR tags `vX.Y.Z+qn` and cuts a GitHub Release.
+4. Bump `jito_shredstream_version` in `role_solana` group_vars to the new
+   `X.Y.Z+qn` and release `role_solana`; Drone → `role_chain_build` builds the
+   tag and publishes the binary.
 
 ## Branch naming
 

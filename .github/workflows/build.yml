@@ -16,6 +16,19 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
 
+      # Guard: the [workspace.package] version must keep the +qn build-metadata
+      # marker. role_solana detects the deployed version by substring-matching
+      # `-V` output; a bare X.Y.Z would fail that check and make Ansible reinstall
+      # the proxy on every converge. release-please's default strategy preserves
+      # build metadata across bumps (verified against release-please 17.x), but
+      # this fails loudly if a future version ever regresses and strips it.
+      - name: Assert version carries +qn build metadata
+        run: |
+          line="$(grep -E '^version = ".*" # x-release-please-version' Cargo.toml || true)"
+          echo "workspace.package $line"
+          echo "$line" | grep -qE '^version = "[0-9]+\.[0-9]+\.[0-9]+\+qn" # x-release-please-version' \
+            || { echo "::error file=Cargo.toml::[workspace.package] version is missing the '+qn' build-metadata marker (got: ${line:-<none>}). See CONTRIBUTING.md > Versioning & releases."; exit 1; }
+
       - name: Clippy check
         run: cargo clippy --all-features --all-targets --tests -- -D warnings
 
