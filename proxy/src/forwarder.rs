@@ -167,11 +167,13 @@ impl DupLagTracker {
     /// discards: `Packet::data()` hides payloads of discarded packets, and the
     /// duplicates are exactly what we need to observe.
     pub fn observe(&self, data: &[u8], now: Instant, addr: IpAddr, port: u16) {
+        // Rotate on every arrival (one relaxed load when not due) so the
+        // retention window holds regardless of the sampling rate.
+        self.maybe_rotate(now);
         let hash = self.hasher.hash_one(data);
         if hash & self.sample_mask != 0 {
             return;
         }
-        self.maybe_rotate(now);
         let cur = self.cur.load(Ordering::Relaxed);
         // The older shard only ever loses entries (inserts target `cur`), so a
         // plain read is race-free here.
@@ -1089,6 +1091,35 @@ mod tests {
         // duplicate now records with it as the winner
         tracker.observe(&shred, now + Duration::from_millis(51), a, 1);
         assert!(tracker.hist.get(&(b, 2, a, 1)).is_some());
+    }
+
+    #[test]
+    fn test_dup_lag_rotation_runs_on_unsampled_traffic() {
+        // With sampling enabled, unsampled packets must still drive rotation
+        // so first-seen retention is bounded by time, not by sampled arrivals.
+        let tracker = DupLagTracker::new_seeded(Duration::from_millis(10), 4, 99);
+        let now = std::time::Instant::now();
+        let a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+        let sampled = (0..=255u8)
+            .map(|i| [i; 64])
+            .find(|p| tracker.hasher.hash_one(p.as_slice()) & 3 == 0)
+            .expect("some payload samples");
+        let unsampled = (0..=255u8)
+            .map(|i| [i; 64])
+            .find(|p| tracker.hasher.hash_one(p.as_slice()) & 3 != 0)
+            .expect("some payload does not sample");
+
+        tracker.observe(&sampled, now, a, 1);
+        assert_eq!(tracker.shards[0].len() + tracker.shards[1].len(), 1);
+        // an UNSAMPLED arrival after a 5-period gap must still rotate (and,
+        // having overshot a full period, clear both shards)
+        tracker.observe(&unsampled, now + Duration::from_millis(50), a, 1);
+        assert_eq!(
+            tracker.shards[0].len() + tracker.shards[1].len(),
+            0,
+            "unsampled traffic must drive rotation"
+        );
     }
 
     #[test]
