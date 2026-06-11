@@ -133,11 +133,32 @@ impl DupLagTracker {
             )
             .is_ok()
         {
-            let prev = self.cur.load(Ordering::Relaxed) ^ 1;
+            let cur = self.cur.load(Ordering::Relaxed);
+            let prev = cur ^ 1;
             self.shards[prev].clear();
+            // After an idle gap of a full extra period, `cur` is also entirely
+            // older than the retention window — drop it too so stale entries
+            // can't match late re-arrivals and inflate lag sums.
+            if now_us >= deadline.saturating_add(self.ttl_us) {
+                self.shards[cur].clear();
+            }
             // the cleared shard becomes the new insert target; the old `cur` ages out next rotation
             self.cur.store(prev, Ordering::Relaxed);
         }
+    }
+
+    fn record_lag(&self, first: &FirstSeen, now: Instant, addr: IpAddr, port: u16) {
+        let lag_us = now.duration_since(first.when).as_micros() as u64;
+        let hist = self
+            .hist
+            .entry((first.addr, first.port, addr, port))
+            .or_default();
+        match DUP_LAG_BUCKETS_US.iter().position(|bound| lag_us <= *bound) {
+            Some(i) => hist.buckets[i].fetch_add(1, Ordering::Relaxed),
+            None => hist.overflow.fetch_add(1, Ordering::Relaxed),
+        };
+        hist.count.fetch_add(1, Ordering::Relaxed);
+        hist.sum_micros.fetch_add(lag_us, Ordering::Relaxed);
     }
 
     /// Record one packet arrival. First sighting of these bytes stores
@@ -152,22 +173,24 @@ impl DupLagTracker {
         }
         self.maybe_rotate(now);
         let cur = self.cur.load(Ordering::Relaxed);
-        for shard in [cur, cur ^ 1] {
-            if let Some(first) = self.shards[shard].get(&hash) {
-                let lag_us = now.duration_since(first.when).as_micros() as u64;
-                let key = (first.addr, first.port, addr, port);
-                drop(first);
-                let hist = self.hist.entry(key).or_default();
-                match DUP_LAG_BUCKETS_US.iter().position(|bound| lag_us <= *bound) {
-                    Some(i) => hist.buckets[i].fetch_add(1, Ordering::Relaxed),
-                    None => hist.overflow.fetch_add(1, Ordering::Relaxed),
-                };
-                hist.count.fetch_add(1, Ordering::Relaxed);
-                hist.sum_micros.fetch_add(lag_us, Ordering::Relaxed);
-                return;
+        // The older shard only ever loses entries (inserts target `cur`), so a
+        // plain read is race-free here.
+        if let Some(first) = self.shards[cur ^ 1].get(&hash) {
+            self.record_lag(&first, now, addr, port);
+            return;
+        }
+        // Atomic check-or-insert on the current shard: two threads observing
+        // the same shred concurrently must not both treat it as first-seen
+        // (a double insert would drop the race record and could crown the
+        // later arrival as winner).
+        match self.shards[cur].entry(hash) {
+            dashmap::mapref::entry::Entry::Occupied(first) => {
+                self.record_lag(first.get(), now, addr, port);
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(FirstSeen { when: now, addr, port });
             }
         }
-        self.shards[cur].insert(hash, FirstSeen { when: now, addr, port });
     }
 }
 
@@ -1042,6 +1065,30 @@ mod tests {
             tracker.hist.is_empty(),
             "expired first-seen must not produce a lag record"
         );
+    }
+
+    #[test]
+    fn test_dup_lag_idle_gap_drops_both_shards() {
+        // After an idle gap far beyond the retention window, a re-arrival of
+        // old bytes must be a fresh first-seen, not a multi-second "lag".
+        let tracker = DupLagTracker::new(Duration::from_millis(10), 1);
+        let now = std::time::Instant::now();
+        let a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+        let shred = [3u8; 100];
+
+        tracker.observe(&shred, now, a, 1);
+        // single observe after a 50ms gap (5 retention periods): the one
+        // rotation it triggers must clear BOTH shards
+        tracker.observe(&shred, now + Duration::from_millis(50), b, 2);
+        assert!(
+            tracker.hist.is_empty(),
+            "stale first-seen across an idle gap must not record a lag"
+        );
+        // and the re-arrival was stored as the new first-seen: an immediate
+        // duplicate now records with it as the winner
+        tracker.observe(&shred, now + Duration::from_millis(51), a, 1);
+        assert!(tracker.hist.get(&(b, 2, a, 1)).is_some());
     }
 
     #[test]
