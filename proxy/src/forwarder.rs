@@ -80,6 +80,11 @@ pub struct DupLagTracker {
     cur: AtomicUsize,
     /// Next rotation, as µs since `anchor` (CAS claims the rotation).
     rotate_deadline_us: AtomicU64,
+    /// Makes the shard flip exclusive against observers: a stale `cur` read
+    /// straddling a rotation could otherwise insert the same hash into both
+    /// shards, splitting first-seen. Readers hold this only for the
+    /// lookup+insert of sampled packets; the writer holds it once per ttl.
+    rotation_lock: RwLock<()>,
     anchor: Instant,
     ttl_us: u64,
     /// Sample a packet when `hash & sample_mask == 0`. Hash-based (not random)
@@ -102,6 +107,7 @@ impl DupLagTracker {
             shards: [DashMap::new(), DashMap::new()],
             cur: AtomicUsize::new(0),
             rotate_deadline_us: AtomicU64::new(ttl_us),
+            rotation_lock: RwLock::new(()),
             anchor: Instant::now(),
             ttl_us,
             sample_mask: sample_rate as u64 - 1,
@@ -133,6 +139,8 @@ impl DupLagTracker {
             )
             .is_ok()
         {
+            // exclude observers while the shards flip (see rotation_lock)
+            let _flip = self.rotation_lock.write().unwrap();
             let cur = self.cur.load(Ordering::Relaxed);
             let prev = cur ^ 1;
             self.shards[prev].clear();
@@ -174,6 +182,9 @@ impl DupLagTracker {
         if hash & self.sample_mask != 0 {
             return;
         }
+        // Pin `cur` for the lookup+insert so a concurrent flip can't split the
+        // same hash across both shards (which would fork first-seen).
+        let _pin = self.rotation_lock.read().unwrap();
         let cur = self.cur.load(Ordering::Relaxed);
         // The older shard only ever loses entries (inserts target `cur`), so a
         // plain read is race-free here.
