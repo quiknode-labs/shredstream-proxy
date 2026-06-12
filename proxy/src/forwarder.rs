@@ -2,11 +2,11 @@ use std::{
     collections::HashSet,
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     thread::{Builder, JoinHandle},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use arc_swap::ArcSwap;
@@ -42,6 +42,170 @@ use crate::{
 pub const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
 pub const DEDUPER_NUM_BITS: u64 = 637_534_199; // 76MB
 pub const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
+
+/// Upper bounds (µs) of the dup-lag histogram buckets; observations above the
+/// last bound land in the implicit +Inf bucket (`count`).
+pub const DUP_LAG_BUCKETS_US: [u64; 13] = [
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+];
+/// Prometheus `le` label values (seconds) matching `DUP_LAG_BUCKETS_US`.
+const DUP_LAG_LE_SECONDS: [&str; 13] = [
+    "0.00005", "0.0001", "0.00025", "0.0005", "0.001", "0.0025", "0.005", "0.01", "0.025", "0.05",
+    "0.1", "0.25", "0.5",
+];
+
+struct FirstSeen {
+    when: Instant,
+    addr: IpAddr,
+    port: u16,
+}
+
+#[derive(Default)]
+pub struct DupLagHistogram {
+    /// One counter per `DUP_LAG_BUCKETS_US` band (made cumulative at report time).
+    buckets: [AtomicU64; 13],
+    /// Observations above the last bound.
+    overflow: AtomicU64,
+    pub count: AtomicU64,
+    pub sum_micros: AtomicU64,
+}
+
+/// Measures the lag between a shred's first arrival and later duplicate
+/// arrivals of the same bytes, attributed by (winner, loser) source pair.
+/// Used to quantify how much earlier one shred provider delivers than another.
+pub struct DupLagTracker {
+    /// Two time-rotated shards: lookups check both, inserts go to `cur`.
+    /// Rotation drops the older shard, bounding retention to [ttl, 2*ttl).
+    shards: [DashMap<u64, FirstSeen>; 2],
+    cur: AtomicUsize,
+    /// Next rotation, as µs since `anchor` (CAS claims the rotation).
+    rotate_deadline_us: AtomicU64,
+    /// Makes the shard flip exclusive against observers: a stale `cur` read
+    /// straddling a rotation could otherwise insert the same hash into both
+    /// shards, splitting first-seen. Readers hold this only for the
+    /// lookup+insert of sampled packets; the writer holds it once per ttl.
+    rotation_lock: RwLock<()>,
+    anchor: Instant,
+    ttl_us: u64,
+    /// Sample a packet when `hash & sample_mask == 0`. Hash-based (not random)
+    /// so the winner and loser arrivals of the same shred are both sampled.
+    sample_mask: u64,
+    hasher: ahash::RandomState,
+    /// Lifetime-cumulative histograms keyed by
+    /// (winner addr, winner port, loser addr, loser port).
+    pub hist: DashMap<(IpAddr, u16, IpAddr, u16), DupLagHistogram>,
+}
+
+impl DupLagTracker {
+    pub fn new(ttl: Duration, sample_rate: u32) -> Self {
+        assert!(
+            sample_rate.is_power_of_two(),
+            "dup_lag_sample_rate must be a power of two"
+        );
+        let ttl_us = ttl.as_micros().max(1) as u64;
+        Self {
+            shards: [DashMap::new(), DashMap::new()],
+            cur: AtomicUsize::new(0),
+            rotate_deadline_us: AtomicU64::new(ttl_us),
+            rotation_lock: RwLock::new(()),
+            anchor: Instant::now(),
+            ttl_us,
+            sample_mask: sample_rate as u64 - 1,
+            hasher: ahash::RandomState::new(),
+            hist: DashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_seeded(ttl: Duration, sample_rate: u32, seed: u64) -> Self {
+        let mut tracker = Self::new(ttl, sample_rate);
+        tracker.hasher = ahash::RandomState::with_seeds(seed, seed ^ 1, seed ^ 2, seed ^ 3);
+        tracker
+    }
+
+    fn maybe_rotate(&self, now: Instant) {
+        let now_us = now.duration_since(self.anchor).as_micros() as u64;
+        let deadline = self.rotate_deadline_us.load(Ordering::Relaxed);
+        if now_us < deadline {
+            return;
+        }
+        if self
+            .rotate_deadline_us
+            .compare_exchange(
+                deadline,
+                now_us + self.ttl_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            // exclude observers while the shards flip (see rotation_lock)
+            let _flip = self.rotation_lock.write().unwrap();
+            let cur = self.cur.load(Ordering::Relaxed);
+            let prev = cur ^ 1;
+            self.shards[prev].clear();
+            // After an idle gap of a full extra period, `cur` is also entirely
+            // older than the retention window — drop it too so stale entries
+            // can't match late re-arrivals and inflate lag sums.
+            if now_us >= deadline.saturating_add(self.ttl_us) {
+                self.shards[cur].clear();
+            }
+            // the cleared shard becomes the new insert target; the old `cur` ages out next rotation
+            self.cur.store(prev, Ordering::Relaxed);
+        }
+    }
+
+    fn record_lag(&self, first: &FirstSeen, now: Instant, addr: IpAddr, port: u16) {
+        let lag_us = now.duration_since(first.when).as_micros() as u64;
+        let hist = self
+            .hist
+            .entry((first.addr, first.port, addr, port))
+            .or_default();
+        match DUP_LAG_BUCKETS_US.iter().position(|bound| lag_us <= *bound) {
+            Some(i) => hist.buckets[i].fetch_add(1, Ordering::Relaxed),
+            None => hist.overflow.fetch_add(1, Ordering::Relaxed),
+        };
+        hist.count.fetch_add(1, Ordering::Relaxed);
+        hist.sum_micros.fetch_add(lag_us, Ordering::Relaxed);
+    }
+
+    /// Record one packet arrival. First sighting of these bytes stores
+    /// (now, source); a later sighting within the retention window records the
+    /// lag into the (winner, loser) histogram. Must run BEFORE dedup marks
+    /// discards: `Packet::data()` hides payloads of discarded packets, and the
+    /// duplicates are exactly what we need to observe.
+    pub fn observe(&self, data: &[u8], now: Instant, addr: IpAddr, port: u16) {
+        // Rotate on every arrival (one relaxed load when not due) so the
+        // retention window holds regardless of the sampling rate.
+        self.maybe_rotate(now);
+        let hash = self.hasher.hash_one(data);
+        if hash & self.sample_mask != 0 {
+            return;
+        }
+        // Pin `cur` for the lookup+insert so a concurrent flip can't split the
+        // same hash across both shards (which would fork first-seen).
+        let _pin = self.rotation_lock.read().unwrap();
+        let cur = self.cur.load(Ordering::Relaxed);
+        // The older shard only ever loses entries (inserts target `cur`), so a
+        // plain read is race-free here.
+        if let Some(first) = self.shards[cur ^ 1].get(&hash) {
+            self.record_lag(&first, now, addr, port);
+            return;
+        }
+        // Atomic check-or-insert on the current shard: two threads observing
+        // the same shred concurrently must not both treat it as first-seen
+        // (a double insert would drop the race record and could crown the
+        // later arrival as winner).
+        match self.shards[cur].entry(hash) {
+            dashmap::mapref::entry::Entry::Occupied(first) => {
+                self.record_lag(first.get(), now, addr, port);
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(FirstSeen { when: now, addr, port });
+            }
+        }
+    }
+}
 
 /// Bind to ports and start forwarding shreds
 #[allow(clippy::too_many_arguments)]
@@ -256,6 +420,17 @@ fn recv_from_channel_and_send_multiple_dest(
     }
 
     let mut packet_batch_vec = vec![packet_batch];
+
+    // Observe BEFORE dedup: Packet::data() returns None once a packet is marked
+    // discard, and duplicate arrivals are exactly what dup-lag must see.
+    if let Some(dup_lag) = metrics.dup_lag.as_ref() {
+        let now = Instant::now();
+        packet_batch_vec[0].iter().for_each(|packet| {
+            if let Some(data) = packet.data(..) {
+                dup_lag.observe(data, now, packet.meta().addr, listen_port);
+            }
+        });
+    }
 
     let num_deduped = solana_perf::deduper::dedup_packets_and_count_discards(
         &deduper.read().unwrap(),
@@ -512,11 +687,15 @@ pub struct ShredMetrics {
     pub agg_success_forward_cumulative: AtomicU64,
     pub agg_fail_forward_cumulative: AtomicU64,
     pub duplicate_cumulative: AtomicU64,
+
+    /// First-seen vs duplicate-arrival lag tracking (`--measure-dup-lag`).
+    /// Histograms are lifetime-cumulative and are NOT cleared by `reset()`.
+    pub dup_lag: Option<DupLagTracker>,
 }
 
 impl Default for ShredMetrics {
     fn default() -> Self {
-        Self::new(false, 0, String::new())
+        Self::new(false, 0, String::new(), None)
     }
 }
 
@@ -525,11 +704,13 @@ impl ShredMetrics {
         enabled_grpc_service: bool,
         multicast_subscribe_port: u16,
         multicast_device: String,
+        dup_lag: Option<DupLagTracker>,
     ) -> Self {
         Self {
             enabled_grpc_service,
             multicast_subscribe_port,
             multicast_device,
+            dup_lag,
             received: Default::default(),
             success_forward: Default::default(),
             fail_forward: Default::default(),
@@ -622,6 +803,61 @@ impl ShredMetrics {
                 false
             },
         );
+
+        // Lifetime-cumulative Prometheus-style histogram per (winner, loser) source pair.
+        // Telegraf turns this into shredstream_proxy_dup_lag_seconds_bucket{le,...}/_count/_sum.
+        if let Some(dup_lag) = &self.dup_lag {
+            let device_for = |port: u16| {
+                if port == self.multicast_subscribe_port {
+                    self.multicast_device.as_str()
+                } else {
+                    "unicast"
+                }
+            };
+            for entry in dup_lag.hist.iter() {
+                let (winner_addr, winner_port, loser_addr, loser_port) = *entry.key();
+                let hist = entry.value();
+                let mut cumulative = 0u64;
+                for (i, le) in DUP_LAG_LE_SECONDS.iter().enumerate() {
+                    cumulative += hist.buckets[i].load(Ordering::Relaxed);
+                    datapoint_info!("shredstream_proxy-dup_lag_seconds",
+                        "winner_addr" => winner_addr.to_string(),
+                        "winner_port" => winner_port.to_string(),
+                        "winner_device" => device_for(winner_port),
+                        "loser_addr" => loser_addr.to_string(),
+                        "loser_port" => loser_port.to_string(),
+                        "loser_device" => device_for(loser_port),
+                        "le" => *le,
+                        ("bucket", cumulative, i64),
+                    );
+                }
+                let count = hist.count.load(Ordering::Relaxed);
+                datapoint_info!("shredstream_proxy-dup_lag_seconds",
+                    "winner_addr" => winner_addr.to_string(),
+                    "winner_port" => winner_port.to_string(),
+                    "winner_device" => device_for(winner_port),
+                    "loser_addr" => loser_addr.to_string(),
+                    "loser_port" => loser_port.to_string(),
+                    "loser_device" => device_for(loser_port),
+                    "le" => "+Inf",
+                    ("bucket", count, i64),
+                );
+                datapoint_info!("shredstream_proxy-dup_lag_seconds",
+                    "winner_addr" => winner_addr.to_string(),
+                    "winner_port" => winner_port.to_string(),
+                    "winner_device" => device_for(winner_port),
+                    "loser_addr" => loser_addr.to_string(),
+                    "loser_port" => loser_port.to_string(),
+                    "loser_device" => device_for(loser_port),
+                    ("count", count, i64),
+                    (
+                        "sum",
+                        hist.sum_micros.load(Ordering::Relaxed) as f64 / 1e6,
+                        f64
+                    ),
+                );
+            }
+        }
     }
 
     /// resets current values, increments cumulative values
@@ -658,7 +894,9 @@ mod tests {
     };
     use solana_sdk::packet::{PacketFlags, PACKET_DATA_SIZE};
 
-    use crate::forwarder::{recv_from_channel_and_send_multiple_dest, ShredMetrics};
+    use std::sync::atomic::Ordering;
+
+    use crate::forwarder::{recv_from_channel_and_send_multiple_dest, DupLagTracker, ShredMetrics};
 
     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
         let mut buf = [0u8; PACKET_DATA_SIZE];
@@ -765,5 +1003,155 @@ mod tests {
                 .fold(0, |acc, elem| acc + elem.lock().unwrap().len()),
             6
         );
+    }
+
+    #[test]
+    fn test_dup_lag_records_winner_loser_pair() {
+        let tracker = DupLagTracker::new(Duration::from_secs(10), 1);
+        let now = std::time::Instant::now();
+        let jito = IpAddr::V4(Ipv4Addr::new(202, 8, 9, 160));
+        let dz = IpAddr::V4(Ipv4Addr::new(148, 51, 121, 14));
+        let shred = [42u8; 1228];
+
+        // first arrival: DZ multicast wins
+        tracker.observe(&shred, now, dz, 7733);
+        assert!(tracker.hist.is_empty(), "first sighting must not record");
+
+        // duplicate 2.4ms later via unicast: (winner=dz, loser=jito) in the 2.5ms bucket
+        tracker.observe(&shred, now + Duration::from_micros(2_400), jito, 20000);
+        let hist = tracker
+            .hist
+            .get(&(dz, 7733, jito, 20000))
+            .expect("pair recorded with winner first");
+        assert_eq!(hist.count.load(Ordering::Relaxed), 1);
+        assert_eq!(hist.sum_micros.load(Ordering::Relaxed), 2_400);
+        // bands: index 5 is (1ms, 2.5ms]
+        assert_eq!(hist.buckets[5].load(Ordering::Relaxed), 1);
+        assert_eq!(
+            (0..13)
+                .map(|i| hist.buckets[i].load(Ordering::Relaxed))
+                .sum::<u64>(),
+            1
+        );
+
+        // different bytes are a different shred: no cross-recording
+        let other = [7u8; 1228];
+        tracker.observe(&other, now, jito, 20000);
+        assert_eq!(tracker.hist.len(), 1);
+    }
+
+    #[test]
+    fn test_dup_lag_overflow_bucket() {
+        let tracker = DupLagTracker::new(Duration::from_secs(10), 1);
+        let now = std::time::Instant::now();
+        let a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+        let shred = [9u8; 100];
+        tracker.observe(&shred, now, a, 1);
+        tracker.observe(&shred, now + Duration::from_secs(2), b, 2); // > 500ms => +Inf band
+        let hist = tracker.hist.get(&(a, 1, b, 2)).unwrap();
+        assert_eq!(hist.count.load(Ordering::Relaxed), 1);
+        assert_eq!(hist.overflow.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            (0..13)
+                .map(|i| hist.buckets[i].load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_dup_lag_rotation_evicts_first_seen() {
+        let tracker = DupLagTracker::new(Duration::from_millis(1), 1);
+        let now = std::time::Instant::now();
+        let a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+        let shred = [5u8; 100];
+
+        tracker.observe(&shred, now, a, 1);
+        // two rotations later (entry aged out of both shards), the same bytes
+        // are treated as a fresh first arrival, not a duplicate
+        tracker.maybe_rotate(now + Duration::from_millis(2));
+        tracker.maybe_rotate(now + Duration::from_millis(4));
+        tracker.observe(&shred, now + Duration::from_millis(5), b, 2);
+        assert!(
+            tracker.hist.is_empty(),
+            "expired first-seen must not produce a lag record"
+        );
+    }
+
+    #[test]
+    fn test_dup_lag_idle_gap_drops_both_shards() {
+        // After an idle gap far beyond the retention window, a re-arrival of
+        // old bytes must be a fresh first-seen, not a multi-second "lag".
+        let tracker = DupLagTracker::new(Duration::from_millis(10), 1);
+        let now = std::time::Instant::now();
+        let a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+        let shred = [3u8; 100];
+
+        tracker.observe(&shred, now, a, 1);
+        // single observe after a 50ms gap (5 retention periods): the one
+        // rotation it triggers must clear BOTH shards
+        tracker.observe(&shred, now + Duration::from_millis(50), b, 2);
+        assert!(
+            tracker.hist.is_empty(),
+            "stale first-seen across an idle gap must not record a lag"
+        );
+        // and the re-arrival was stored as the new first-seen: an immediate
+        // duplicate now records with it as the winner
+        tracker.observe(&shred, now + Duration::from_millis(51), a, 1);
+        assert!(tracker.hist.get(&(b, 2, a, 1)).is_some());
+    }
+
+    #[test]
+    fn test_dup_lag_rotation_runs_on_unsampled_traffic() {
+        // With sampling enabled, unsampled packets must still drive rotation
+        // so first-seen retention is bounded by time, not by sampled arrivals.
+        let tracker = DupLagTracker::new_seeded(Duration::from_millis(10), 4, 99);
+        let now = std::time::Instant::now();
+        let a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+        let sampled = (0..=255u8)
+            .map(|i| [i; 64])
+            .find(|p| tracker.hasher.hash_one(p.as_slice()) & 3 == 0)
+            .expect("some payload samples");
+        let unsampled = (0..=255u8)
+            .map(|i| [i; 64])
+            .find(|p| tracker.hasher.hash_one(p.as_slice()) & 3 != 0)
+            .expect("some payload does not sample");
+
+        tracker.observe(&sampled, now, a, 1);
+        assert_eq!(tracker.shards[0].len() + tracker.shards[1].len(), 1);
+        // an UNSAMPLED arrival after a 5-period gap must still rotate (and,
+        // having overshot a full period, clear both shards)
+        tracker.observe(&unsampled, now + Duration::from_millis(50), a, 1);
+        assert_eq!(
+            tracker.shards[0].len() + tracker.shards[1].len(),
+            0,
+            "unsampled traffic must drive rotation"
+        );
+    }
+
+    #[test]
+    fn test_dup_lag_hash_sampling_keeps_pairs_consistent() {
+        // mask=3 samples 1-in-4 by hash; a sampled shred must record its pair
+        // (both arrivals observed), an unsampled one must record nothing.
+        let tracker = DupLagTracker::new_seeded(Duration::from_secs(10), 4, 1234);
+        let now = std::time::Instant::now();
+        let a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+
+        let mut sampled = 0u64;
+        for i in 0..64u8 {
+            let payload = [i; 64];
+            let expect_sampled = tracker.hasher.hash_one(payload.as_slice()) & 3 == 0;
+            tracker.observe(&payload, now, a, 1);
+            tracker.observe(&payload, now + Duration::from_micros(100), b, 2);
+            sampled += expect_sampled as u64;
+        }
+        assert!(sampled > 0, "seed should sample at least one of 64 payloads");
+        let hist = tracker.hist.get(&(a, 1, b, 2)).expect("sampled pairs recorded");
+        assert_eq!(hist.count.load(Ordering::Relaxed), sampled);
     }
 }

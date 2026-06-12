@@ -144,6 +144,23 @@ struct CommonArgs {
     /// Number of threads to use. Defaults to use up to 4.
     #[arg(long, env)]
     num_threads: Option<usize>,
+
+    /// Measure the lag between a shred's first arrival and later duplicate
+    /// arrivals, per (winner, loser) source pair. Emits the
+    /// `shredstream_proxy-dup_lag_seconds` cumulative histogram.
+    #[arg(long, env, default_value_t = false)]
+    measure_dup_lag: bool,
+
+    /// Retention window (ms) for matching duplicates to their first arrival.
+    /// Cross-provider duplicates arrive within tens of ms; the window bounds
+    /// tracker memory to roughly pps * 2 * ttl entries.
+    #[arg(long, env, default_value_t = 1_000)]
+    dup_lag_ttl_ms: u64,
+
+    /// Sample 1-in-N packets for dup-lag measurement (power of two; 1 = all).
+    /// Hash-based, so both arrivals of a sampled shred are observed.
+    #[arg(long, env, default_value_t = 1)]
+    dup_lag_sample_rate: u32,
 }
 
 #[derive(Debug, Error)]
@@ -238,6 +255,12 @@ fn main() -> Result<(), ShredstreamProxyError> {
     {
         return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "No destinations found. You must provide values for --dest-ip-ports or --endpoint-discovery-url.")));
     }
+    if !args.dup_lag_sample_rate.is_power_of_two() {
+        return Err(ShredstreamProxyError::IoError(io::Error::new(
+            ErrorKind::InvalidInput,
+            "--dup-lag-sample-rate must be a power of two (1 = sample all).",
+        )));
+    }
 
     let exit = Arc::new(AtomicBool::new(false));
     let (shutdown_sender, shutdown_receiver) =
@@ -255,10 +278,17 @@ fn main() -> Result<(), ShredstreamProxyError> {
         }));
     }
 
+    let dup_lag = args.measure_dup_lag.then(|| {
+        forwarder::DupLagTracker::new(
+            Duration::from_millis(args.dup_lag_ttl_ms),
+            args.dup_lag_sample_rate,
+        )
+    });
     let metrics = Arc::new(ShredMetrics::new(
         args.grpc_service_port.is_some(),
         args.multicast_subscribe_port,
         args.multicast_device.clone(),
+        dup_lag,
     ));
 
     let runtime = Runtime::new()?;
